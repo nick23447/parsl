@@ -51,6 +51,12 @@ from parsl.process_loggers import wrap_with_logs
 from parsl.usage_tracking.usage import UsageTracker
 from parsl.utils import get_std_fname_mode, get_version
 
+# SAGA imports
+
+import networkx as nx
+from parsl.providers.kubernetes.kube import KubernetesProvider
+import itertools
+
 logger = logging.getLogger(__name__)
 
 
@@ -166,7 +172,7 @@ class DataFlowKernel:
                                        workflow_info))
 
         self.memoizer: Memoizer = config.memoizer if config.memoizer is not None else BasicMemoizer()
-        self.memoizer.start(run_dir=self.run_dir, config_run_dir=self.config.run_dir)
+        self.memoizer.start(run_dir=self.run_dir)
 
         # this must be set before executors are added since add_executors calls
         # job_status_poller.add_executors.
@@ -969,6 +975,7 @@ class DataFlowKernel:
                        'try_time_launched': None,
                        'try_time_returned': None,
                        'resource_specification': resource_specification}
+        
 
         for kw in ['stdout', 'stderr']:
             if kw in app_kwargs:
@@ -1034,19 +1041,145 @@ class DataFlowKernel:
         # after we set it pending, then the last one will cause a launch, and the
         # explicit one won't.
 
-        for d in depends:
+        if not self._config.lazy_dfk:
+            for d in depends:
 
-            def callback_adapter(dep_fut: Future) -> None:
-                self.launch_if_ready(task_record)
+                def callback_adapter(dep_fut: Future) -> None:
+                    self.launch_if_ready(task_record)
 
-            try:
-                d.add_done_callback(callback_adapter)
-            except Exception as e:
-                logger.error("add_done_callback got an exception {} which will be ignored".format(e))
+                try:
+                    d.add_done_callback(callback_adapter)
+                except Exception as e:
+                    logger.error("add_done_callback got an exception {} which will be ignored".format(e))
 
-        self.launch_if_ready(task_record)
+            self.launch_if_ready(task_record)
+        
+        else:
+            # Lazy Behavior: Do nothing. 
+            # We just added the task to self.tasks. We wait for .execute()
+            logger.info(f"Task {task_id} held for lazy execution.")
 
         return app_fu
+    
+    def execute(self) -> None:
+        """
+        Start processing tasks in the DFK.
+
+        This is a no-op for the current implementation, as tasks are
+        processed as they are submitted.
+        """
+        config = self.config
+        if config.saga_scheduler:
+            # Build the network
+            for executor in config.executors:
+                # network_graph: Optional[nx.Graph] = self._build_network_graph(executor.provider) \
+                #     if hasattr(executor, 'provider') else None
+            
+                network_graph: Optional[nx.Graph] = self._build_network_graph(executor.provider)
+                print(network_graph)
+
+            task_graph = self._build_task_graph() 
+
+            print(task_graph)
+
+            scheduler = config.saga_scheduler
+            schedule = self.schedule_tasks(scheduler, network_graph, task_graph) \
+                if task_graph and network_graph else None
+            
+            print("Scheduling result:", schedule)
+
+
+            # run the scheduler
+            # send task map to provider so certain tasks can be scheduled to certain nodes
+            # Somehow include the scheduling decisions in the task records "resource_specification" field
+            
+        for task_record in self.tasks.values():
+            for dependency in task_record['depends']:
+                def callback_adapter(dep_fut: Future) -> None:
+                    self.launch_if_ready(task_record)
+
+                try:
+                    dependency.add_done_callback(callback_adapter)
+                except Exception as e:
+                    logger.error("add_done_callback got an exception {} which will be ignored".format(e))
+            self.launch_if_ready(task_record)
+
+    def _build_task_graph(self) -> nx.DiGraph:
+        """
+        Builds a task graph of the current tasks in the DFK.
+        Uses app_fut as id but provides easy to read label
+        for each task
+
+        Returns:
+            A networkx DiGraph representing the tasks and their dependencies.
+        """
+        WEIGHT = 1 # arbitrary weight for now
+        COMM_TIME = 1 # arbitrary communication time for now
+
+        G = nx.DiGraph()
+        for task_record in self.tasks.values():
+            #task = str(task_record['app_fu'])
+            #G.add_node(task, weight=WEIGHT, label=task_record['id'])
+            task = str(task_record['id'])
+            G.add_node(task)
+        
+            for dependency in task_record['depends']:
+                lookup = [tr for tr in self.tasks.values() if tr['app_fu'] == dependency]
+                dep = str(lookup[0]['id'])
+                G.add_edge(dep, task)
+
+        for node in G.nodes:
+            G.nodes[node]['weight'] = WEIGHT
+        for edge in G.edges:
+            G.edges[edge]['weight'] = COMM_TIME
+
+        return G
+
+    def _build_network_graph(self, provider) -> Optional[nx.Graph]:
+        """
+        Builds a network graph of the current executors in the DFK.
+        Uses executor label as id but provides easy to read label
+        for each executor
+
+        Returns:
+            A networkx DiGraph representing the executors and their network connections.
+        """
+        WEIGHT = 1 
+        COMM_TIME = 1 
+
+        if isinstance(provider, KubernetesProvider):
+            pod_details = provider.get_graph_nodes()
+            
+            G = nx.Graph() 
+            
+            pod_ids = []
+            for pod in pod_details:
+                pid = pod["id"]
+                pod_ids.append(pid)
+                G.add_node(pid)
+               
+
+            edges = list(itertools.combinations(pod_ids, 2))
+            G.add_edges_from(edges)
+            
+            # Add self-loops for same-node communication
+            for pod_id in pod_ids:
+                G.add_edge(pod_id, pod_id)
+
+            for node in G.nodes:
+                G.nodes[node]['weight'] = WEIGHT
+            for edge in G.edges:
+                G.edges[edge]['weight'] = COMM_TIME
+            
+            return G
+        return None
+
+    def schedule_tasks(self, scheduler, network_graph: nx.Graph, task_graph: nx.DiGraph) -> None:
+        """
+        Schedule tasks based on the network graph and task graph.
+        Currently a placeholder for future implementation.
+        """
+        return scheduler.schedule(network_graph, task_graph)
 
     # it might also be interesting to assert that all DFK
     # tasks are in a "final" state (3,4,5) when the DFK
@@ -1238,6 +1371,27 @@ class DataFlowKernel:
             tid = repr(dep)
         return tid
 
+# class SagaDataFlowKernel(DataFlowKernel):
+#     """The DataFlowKernel adds dependency awareness to an existing executor.
+
+#     It is responsible for managing futures, such that when dependencies are resolved,
+#     pending tasks move to the runnable state.
+
+#     Here is a simplified diagram of what happens internally::
+
+#          User             |        DFK         |    Executor
+#         ----------------------------------------------------------
+#                           |                    |
+#                Task-------+> +Submit           |
+#              App_Fu<------+--|                 |
+#                           |  Dependencies met  |
+#                           |  Generate Task/    | 
+#                           |  Network Graph     | 
+#                           |        task_graph----+--> +Submit
+#                           |        Ex_Fu<------+----|
+
+#     """
+#     pass
 
 class DataFlowKernelLoader:
     """Manage which DataFlowKernel is active.
@@ -1270,6 +1424,9 @@ class DataFlowKernelLoader:
         if config is None:
             cls._dfk = DataFlowKernel(Config())
         else:
+            # if config.execution.method == 'saga':
+            #     cls._dfk = SagaDataFlowKernel(config)
+            # else:
             cls._dfk = DataFlowKernel(config)
 
         return cls._dfk

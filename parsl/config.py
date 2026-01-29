@@ -16,6 +16,11 @@ from parsl.usage_tracking.levels import DISABLED as USAGE_TRACKING_DISABLED
 from parsl.usage_tracking.levels import LEVEL_3 as USAGE_TRACKING_LEVEL_3
 from parsl.utils import RepresentationMixin
 
+try:
+    from saga.scheduler import Scheduler 
+except ImportError:
+    pass
+
 logger = logging.getLogger(__name__)
 
 
@@ -105,7 +110,9 @@ class Config(RepresentationMixin, UsageInformation):
                  monitoring: Optional[MonitoringHub] = None,
                  usage_tracking: int = 0,
                  project_name: Optional[str] = None,
-                 initialize_logging: bool = True) -> None:
+                 initialize_logging: bool = True,
+                 lazy_dfk: bool = False,
+                 saga_scheduler: Optional["Scheduler"] = None) -> None:
 
         executors = tuple(executors or [])
         if not executors:
@@ -131,6 +138,11 @@ class Config(RepresentationMixin, UsageInformation):
         self.initialize_logging = initialize_logging
         self.monitoring = monitoring
         self.std_autopath: Optional[Callable] = std_autopath
+        self.lazy_dfk = lazy_dfk
+        self.saga_scheduler = saga_scheduler
+
+        if self.saga_scheduler is not None and not self.lazy_dfk:
+            raise ConfigurationError("saga_scheduler can only be set when lazy_dfk is True")
 
     @property
     def executors(self) -> Sequence[ParslExecutor]:

@@ -167,7 +167,11 @@ class KubernetesProvider(ExecutionProvider, RepresentationMixin):
         self.resources: Dict[object, Dict[str, Any]]
         self.resources = {}
 
-    def submit(self, cmd_string: str, tasks_per_node: int, job_name: str = "parsl.kube"):
+    def submit(self, cmd_string: str, 
+               tasks_per_node: int, 
+               job_name: str = "parsl.kube", 
+               node_name: Optional[str] = None # TODO: Update this with scheduling logic
+               ) -> str:
         """ Submit a job
         Args:
              - cmd_string  :(String) - Name of the container to initiate
@@ -203,8 +207,11 @@ class KubernetesProvider(ExecutionProvider, RepresentationMixin):
                          cmd_string=formatted_cmd,
                          volumes=self.persistent_volumes,
                          service_account_name=self.service_account_name,
-                         annotations=self.annotations)
+                         annotations=self.annotations,
+                         node_name=node_name)
         self.resources[job_id] = {'status': JobStatus(JobState.RUNNING), 'pod_name': pod_name}
+
+        #print(self.get_graph_nodes())
 
         return job_id
 
@@ -279,7 +286,8 @@ class KubernetesProvider(ExecutionProvider, RepresentationMixin):
                     cmd_string=None,
                     volumes=[],
                     service_account_name=None,
-                    annotations=None):
+                    annotations=None,
+                    node_name=None): # TODO: Update this with scheduling logic
         """ Create a kubernetes pod for the job.
         Args:
               - image (string) : Docker image to launch
@@ -308,7 +316,7 @@ class KubernetesProvider(ExecutionProvider, RepresentationMixin):
             volume_mounts.append(client.V1VolumeMount(mount_path=volume[1],
                                                       name=volume[0]))
         resources = client.V1ResourceRequirements(limits={'cpu': str(self.max_cpu),
-                                                          'memory': self.max_mem} | self.extra_limits,
+                                                          'memory': self.max_mem} | self.extra_limits, # limit which tasks can run on which pods
                                                   requests={'cpu': str(self.init_cpu),
                                                             'memory': self.init_mem} | self.extra_requests,
                                                   )
@@ -342,7 +350,8 @@ class KubernetesProvider(ExecutionProvider, RepresentationMixin):
         spec = client.V1PodSpec(containers=[container],
                                 image_pull_secrets=[secret],
                                 volumes=volume_defs,
-                                service_account_name=service_account_name)
+                                service_account_name=service_account_name,
+                                node_name=node_name)
 
         pod = client.V1Pod(spec=spec, metadata=metadata)
         api_response = self.kube_client.create_namespaced_pod(namespace=self.namespace,
@@ -356,6 +365,60 @@ class KubernetesProvider(ExecutionProvider, RepresentationMixin):
                                                               namespace=self.namespace,
                                                               body=client.V1DeleteOptions())
         logger.debug("Pod deleted. status='{0}'".format(str(api_response.status)))
+
+    # def get_pod_details(self) -> client.V1Pod:
+    #     """ 
+    #     Get a specific kubernetes pod object for a given job ID.
+    #     Defaults to all pods if no job ID is given.
+
+    #     Args:
+    #         job_id: The job ID of the pod to retrieve
+
+    #     Returns:
+    #         The kubernetes V1Pod object
+    #     """
+    #     try:
+    #         # Returns a V1PodList object; we return the .items list
+    #         pod_list = self.kube_client.list_namespaced_pod(self.namespace)
+    #         return pod_list.items
+            
+    #     except Exception as e:
+    #         logger.error(f"Failed to retrieve pod details: {e}")
+            # return []
+
+    def get_graph_nodes(self) -> List[Dict[str, Any]]:
+        """
+        Returns a list of 'Processors' for the HEFT algorithm.
+        Each item is a Pod (execution unit), enriched with 
+        topology data (host_ip) to calculate communication costs.
+        """
+        try:
+            pod_list = self.kube_client.list_namespaced_pod(self.namespace)
+            
+            processors = []
+            for pod in pod_list.items:
+                # We only want Running pods that are ready to accept work
+                # if pod.status.phase == 'Running' and pod.status.pod_ip:
+                    
+                processor_info = {
+                    "id": pod.metadata.name,         # unique worker ID
+                    # "execution_speed": 1.0,          # Standard weight for HEFT
+                    "network_info": {
+                        "pod_ip": pod.status.pod_ip, # Internal IP
+                        "host_ip": pod.status.host_ip # THE PHYSICAL NODE IP
+                    }
+                }
+                processors.append(processor_info)
+                    
+            return processors
+
+        except Exception as e:
+            logger.error(f"Failed to retrieve HEFT nodes: {e}")
+            return []
+
+        except Exception as e:
+            logger.error(f"Failed to retrieve graph nodes: {e}")
+            return []
 
     @property
     def label(self):
